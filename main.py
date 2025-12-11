@@ -494,7 +494,7 @@ gatenet_cfg = {
     'name': 'GATENet_strong',
     'builder': lambda: GATENetOptimized(num_classes=10, channels=(96,192,384), heads=(4,8,8)),
     'batch_size': 128,
-    'epochs': 200,
+    'epochs': 50,
     'lr': 5e-4,
     'weight_decay': 0.1,
     'train_transform': augment_strong(),
