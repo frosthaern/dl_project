@@ -464,7 +464,7 @@ smallcnn_cfg = {
     'name': 'SmallCNN',
     'builder': lambda: SmallCNN(num_classes=10),
     'batch_size': 128,
-    'epochs': 100,            # moderate
+    'epochs': 50,            # moderate
     'lr': 3e-4,
     'weight_decay': 0.05,
     'train_transform': augment_medium(),
@@ -479,7 +479,7 @@ tinyvit_cfg = {
     'name': 'TinyViT_small',
     'builder': lambda: TinyViT(img_size=32, patch_size=4, embed_dim=128, depth=3, num_heads=4, num_classes=10),
     'batch_size': 128,
-    'epochs': 80,             # shorter
+    'epochs': 50,             # shorter
     'lr': 3e-4,
     'weight_decay': 0.05,
     'train_transform': augment_light(),
