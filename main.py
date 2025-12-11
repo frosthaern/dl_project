@@ -1,47 +1,63 @@
+"""
+Complete training script: ResNet18, TinyViT (medium), Hybrid GATENet (medium).
+Strong augmentations (AutoAugment + RandomErasing), Mixup & CutMix,
+LR warmup + Cosine scheduler, checkpointing, plots, classification reports,
+and final comparison outputs.
+
+Save as main.py and run: python main.py
+"""
+
 import os
 import json
 import time
 import csv
 import logging
-from datetime import datetime
 from collections import OrderedDict
+from datetime import datetime
 
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
+from torchvision.transforms.autoaugment import AutoAugmentPolicy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix, classification_report
 
-# -------------------------
-# CONFIG
-# -------------------------
+# =========================
+# CONFIG - edit if needed
+# =========================
 SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 128
-EPOCHS = 30
+EPOCHS = 200                       # Option 3: 200 epochs
 LR = 3e-4
 WEIGHT_DECAY = 0.05
 NUM_WORKERS = 4
-LOG_ROOT = "results"
-USE_TORCH_COMPILE = True
-USE_AMP = True
 
-os.makedirs(LOG_ROOT, exist_ok=True)
+RESULTS_DIR = "results"
+USE_TORCH_COMPILE = True           # set False if torch < 2.0 or causing issues
+USE_AMP = True                     # automatic mixed precision
+MIXUP_ALPHA = 0.8                  # mixup beta param
+CUTMIX_ALPHA = 1.0                 # cutmix beta param
+MIXUP_PROB = 0.5                   # probability to apply mixup/cutmix on batch
+CUTMIX_PROB = 0.5                  # when mixing, prob of using cutmix (else mixup)
+WARMUP_EPOCHS = 5
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # reproducibility
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-# -------------------------
-# Logging helper
-# -------------------------
+# =========================
+# Logging helpers
+# =========================
 def get_logger(name, folder):
     os.makedirs(folder, exist_ok=True)
     logger = logging.getLogger(name)
@@ -52,18 +68,19 @@ def get_logger(name, folder):
         logger.addHandler(fh)
     return logger
 
-# -------------------------
-# Data
-# -------------------------
+# =========================
+# Data & Augmentations
+# =========================
 mean = (0.4914, 0.4822, 0.4465)
 std = (0.2023, 0.1994, 0.2010)
 
 train_tf = T.Compose([
     T.RandomCrop(32, padding=4),
     T.RandomHorizontalFlip(),
-    T.ColorJitter(0.3, 0.3, 0.3, 0.05),
+    T.AutoAugment(policy=AutoAugmentPolicy.CIFAR10),
     T.ToTensor(),
     T.Normalize(mean, std),
+    T.RandomErasing(p=0.25)
 ])
 
 test_tf = T.Compose([
@@ -78,31 +95,35 @@ classes = train_ds.classes
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
 test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
-# -------------------------
-# Models
-# -------------------------
-# ResNet-18 baseline (from torchvision)
+# =========================
+# Model definitions
+# =========================
+
+# ResNet-18 baseline (adapted to CIFAR)
 def build_resnet18(num_classes=10):
     m = torchvision.models.resnet18(weights=None)
-    m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)  # adapt for 32x32
+    # adapt first conv for CIFAR 32x32 (kernel 3, stride 1)
+    m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     m.maxpool = nn.Identity()
     m.fc = nn.Linear(m.fc.in_features, num_classes)
     return m
 
-# Tiny ViT baseline
+# TinyViT medium
 class TinyViT(nn.Module):
-    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=128, depth=4, num_heads=4, mlp_ratio=4.0, num_classes=10):
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=192, depth=6, num_heads=6, mlp_ratio=4.0, num_classes=10):
         super().__init__()
         assert img_size % patch_size == 0
         self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) * (img_size // patch_size)
+        self.num_patches = (img_size // patch_size) ** 2
         self.embed_dim = embed_dim
 
         self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=int(embed_dim*mlp_ratio), activation='gelu', batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads,
+                                                   dim_feedforward=int(embed_dim * mlp_ratio),
+                                                   activation='gelu', batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
 
         self.norm = nn.LayerNorm(embed_dim)
@@ -112,19 +133,18 @@ class TinyViT(nn.Module):
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
     def forward(self, x):
-        # x: B,3,32,32
         B = x.shape[0]
-        x = self.patch_embed(x)  # B,embed,H',W'
-        x = x.flatten(2).transpose(1,2)  # B, N, C
+        x = self.patch_embed(x)                 # B,embed,H',W'
+        x = x.flatten(2).transpose(1,2)         # B, N, C
         cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls, x), dim=1)  # B, N+1, C
+        x = torch.cat((cls, x), dim=1)          # B, N+1, C
         x = x + self.pos_embed
         x = self.encoder(x)
         x = self.norm(x)
         cls_out = x[:,0]
         return self.head(cls_out)
 
-# Hybrid model (optimized) - reusing concepts from previous optimized script
+# Hybrid medium: GATENet with medium channels and heads
 class LayerNorm2d(nn.Module):
     def __init__(self, C, eps=1e-6):
         super().__init__()
@@ -148,7 +168,7 @@ class ConvBranch(nn.Module):
         return self.act(self.pw(self.dw(x)))
 
 class PatchAttention(nn.Module):
-    def __init__(self, C, patch_size=(4,4), heads=2):
+    def __init__(self, C, patch_size=(4,4), heads=4):
         super().__init__()
         self.ph, self.pw = patch_size
         self.heads = heads
@@ -166,7 +186,7 @@ class PatchAttention(nn.Module):
         x_p = x_p.contiguous().view(B, C, Hn, Wn, ph*pw).mean(-1)  # B,C,Hn,Wn
         x_p = x_p.permute(0,2,3,1).reshape(B, Hn*Wn, C)
         qkv = self.qkv(x_p).reshape(B, Hn*Wn, 3, self.heads, self.hd).permute(2,0,3,1,4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each: B,heads,N,hd
+        q, k, v = qkv[0], qkv[1], qkv[2]
         attn = torch.einsum("bhnd,bhmd->bhnm", q, k) * self.scale
         attn = attn.softmax(-1)
         out = torch.einsum("bhnm,bhmd->bhnd", attn, v)
@@ -175,7 +195,7 @@ class PatchAttention(nn.Module):
         return out
 
 class HybridBlockOptimized(nn.Module):
-    def __init__(self, C, heads=1, patch_size=(4,4), gate_reduction=4, norm_layer=nn.BatchNorm2d):
+    def __init__(self, C, heads=2, patch_size=(4,4), gate_reduction=4, norm_layer=nn.BatchNorm2d):
         super().__init__()
         self.conv_branch = ConvBranch(C)
         self.attn_branch = PatchAttention(C, patch_size=patch_size, heads=heads)
@@ -192,7 +212,10 @@ class HybridBlockOptimized(nn.Module):
         return self.norm(fused + x), g.mean(dim=(2,3))
 
 class GATENetOptimized(nn.Module):
-    def __init__(self, num_classes=10, channels=(48,96,192), heads=(1,2,2), patch_sizes=((8,8),(4,4),(2,2))):
+    def __init__(self, num_classes=10,
+                 channels=(64,128,256),             # medium
+                 heads=(2,4,4),                    # medium
+                 patch_sizes=((8,8),(4,4),(2,2))):
         super().__init__()
         c1,c2,c3 = channels
         self.stem = nn.Sequential(nn.Conv2d(3, c1, 3, padding=1), nn.BatchNorm2d(c1), nn.GELU())
@@ -205,7 +228,7 @@ class GATENetOptimized(nn.Module):
         self.block3a = HybridBlockOptimized(c3, heads=heads[2], patch_size=patch_sizes[2])
         self.block3b = HybridBlockOptimized(c3, heads=heads[2], patch_size=patch_sizes[2])
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp_head = nn.Sequential(nn.Linear(c3, 128), nn.GELU(), nn.Dropout(0.2), nn.Linear(128, num_classes))
+        self.mlp_head = nn.Sequential(nn.Linear(c3, 256), nn.GELU(), nn.Dropout(0.2), nn.Linear(256, num_classes))
     def forward(self, x, collect_gates=False):
         gate_list = []
         x = self.stem(x)
@@ -221,66 +244,133 @@ class GATENetOptimized(nn.Module):
         logits = self.mlp_head(x)
         return (logits, gate_list) if collect_gates else logits
 
-# -------------------------
-# Training utilities
-# -------------------------
+# =========================
+# Mixup and CutMix utilities
+# =========================
+def rand_bbox(W, H, lam):
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+    # uniform
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    x1 = np.clip(cx - cut_w // 2, 0, W)
+    y1 = np.clip(cy - cut_h // 2, 0, H)
+    x2 = np.clip(cx + cut_w // 2, 0, W)
+    y2 = np.clip(cy + cut_h // 2, 0, H)
+    return x1, y1, x2, y2
+
+def apply_mixup_cutmix(x, y, alpha_mix=MIXUP_ALPHA, alpha_cut=CUTMIX_ALPHA, prob_mix=MIXUP_PROB, prob_cut=CUTMIX_PROB):
+    """Return augmented inputs and a tuple describing the mixed labels/lambda.
+       Returns: x_aug, (y_a, y_b, lam)
+       If no mixing applied, returns x, (y, y, 1.0)
+    """
+    if np.random.rand() > prob_mix:
+        return x, (y, y, 1.0)
+
+    use_cutmix = np.random.rand() < prob_cut
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+
+    if use_cutmix:
+        lam = np.random.beta(alpha_cut, alpha_cut)
+        _, _, H, W = x.size()
+        x1, y1, x2, y2 = rand_bbox(W, H, lam)
+        x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+        lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
+        y_a, y_b = y, y[index]
+        return x, (y_a, y_b, lam)
+    else:
+        lam = np.random.beta(alpha_mix, alpha_mix)
+        x_mixed = lam * x + (1 - lam) * x[index]
+        y_a, y_b = y, y[index]
+        return x_mixed, (y_a, y_b, lam)
+
+# =========================
+# Training / Evaluation
+# =========================
 def maybe_compile(model):
     if USE_TORCH_COMPILE:
         try:
             model = torch.compile(model)
-            return model
-        except Exception:
-            return model
+            print("torch.compile applied")
+        except Exception as e:
+            print(f"torch.compile failed/unsupported: {e}")
     return model
 
-def train_one_epoch(model, loader, optimizer, criterion, scaler=None):
+def train_one_epoch(model, loader, optimizer, criterion, scheduler=None, scaler=None):
     model.train()
-    total_loss, correct, total = 0.0, 0, 0
-    for x,y in tqdm(loader, leave=False):
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for x, y in tqdm(loader, leave=False):
         x, y = x.to(DEVICE), y.to(DEVICE)
+
+        # possibly apply mixup/cutmix
+        x_aug, (y_a, y_b, lam) = apply_mixup_cutmix(x, y)
+
         with torch.cuda.amp.autocast(enabled=(scaler is not None)):
-            logits = model(x)
-            loss = criterion(logits, y)
+            logits = model(x_aug)
+            if lam != 1.0 and (y_a is not None):
+                loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
+            else:
+                loss = criterion(logits, y)
+
+        optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
         else:
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad()
+
+        if scheduler is not None:
+            # step per batch not necessary if stepping per epoch, so optional
+            pass
+
         total_loss += loss.item() * x.size(0)
         _, preds = logits.max(1)
+        # when labels were mixed, accuracy measured wrt argmax only (approx)
         correct += preds.eq(y).sum().item()
         total += y.size(0)
-    return total_loss/total, correct/total
+
+    return total_loss / total, correct / total
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, collect_preds=False):
     model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    all_preds, all_labels = [], []
-    for x,y in loader:
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    preds_all = []
+    labels_all = []
+
+    for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        logits = model(x)
-        loss = criterion(logits, y)
+        with torch.cuda.amp.autocast(enabled=(USE_AMP and DEVICE.startswith("cuda"))):
+            logits = model(x)
+            loss = criterion(logits, y)
+
         total_loss += loss.item() * x.size(0)
         _, preds = logits.max(1)
         correct += preds.eq(y).sum().item()
         total += y.size(0)
-        if collect_preds:
-            all_preds.append(preds.cpu())
-            all_labels.append(y.cpu())
-    if collect_preds:
-        return total_loss/total, correct/total, torch.cat(all_preds).numpy(), torch.cat(all_labels).numpy()
-    return total_loss/total, correct/total, None, None
 
-# -------------------------
-# IO helpers
-# -------------------------
+        if collect_preds:
+            preds_all.append(preds.cpu())
+            labels_all.append(y.cpu())
+
+    if collect_preds:
+        return total_loss / total, correct / total, torch.cat(preds_all).numpy(), torch.cat(labels_all).numpy()
+    return total_loss / total, correct / total, None, None
+
+# =========================
+# IO & plotting
+# =========================
 def ensure_dirs(base, model_name):
-    root = os.path.join(LOG_ROOT, model_name)
+    root = os.path.join(base, model_name)
     ckpt = os.path.join(root, "checkpoints")
     plots = os.path.join(root, "plots")
     os.makedirs(root, exist_ok=True)
@@ -306,7 +396,7 @@ def save_history_json(history, path):
         json.dump(history, f, indent=2)
 
 def plot_history(history, out_png, title_prefix=""):
-    epochs = range(1, len(history["train_loss"])+1)
+    epochs = range(1, len(history["train_loss"]) + 1)
     plt.figure(figsize=(10,4))
     plt.subplot(1,2,1)
     plt.plot(epochs, history["train_loss"], '-o', label='train_loss')
@@ -326,23 +416,29 @@ def plot_confusion(cm, labels, out_png, title="Confusion Matrix"):
     plt.tight_layout()
     plt.savefig(out_png); plt.close()
 
-# -------------------------
+# =========================
 # Experiment runner
-# -------------------------
-def run_experiment(model_builder, model_name, epochs=EPOCHS, lr=LR):
-    root, ckpt_dir, plots_dir = ensure_dirs(LOG_ROOT, model_name)
-    logger = get_logger(model_name, root)
-    logger.info(f"Starting experiment: {model_name} on device {DEVICE}")
+# =========================
+def run_experiment(builder, name, epochs=EPOCHS, lr=LR):
+    root, ckpt_dir, plots_dir = ensure_dirs(RESULTS_DIR, name)
+    logger = get_logger(name, root)
+    logger.info(f"Start experiment {name} at {datetime.now().isoformat()} device={DEVICE}")
 
-    model = model_builder().to(DEVICE)
+    model = builder().to(DEVICE)
     model = maybe_compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    # warmup + cosine scheduler
+    total_steps = epochs
+    # we'll step scheduler per epoch
+    scheduler_warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS)
+    scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs - WARMUP_EPOCHS))
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[WARMUP_EPOCHS])
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     scaler = torch.cuda.amp.GradScaler() if (USE_AMP and DEVICE.startswith("cuda")) else None
 
-    ckpt_path = os.path.join(ckpt_dir, f"{model_name}.pt")
-    history, start_epoch = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}, 0
-
+    ckpt_path = os.path.join(ckpt_dir, f"{name}.pt")
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    start_epoch = 0
     loaded = load_checkpoint(model, optimizer, ckpt_path)
     if loaded:
         history = loaded.get("history", history) if isinstance(loaded, dict) else history
@@ -352,8 +448,8 @@ def run_experiment(model_builder, model_name, epochs=EPOCHS, lr=LR):
     t0 = time.time()
     for epoch in range(start_epoch + 1, epochs + 1):
         ep_start = time.time()
-        print(f"[{model_name}] Epoch {epoch}/{epochs} ...")
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, criterion, scaler=scaler)
+        print(f"[{name}] Epoch {epoch}/{epochs} ...")
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, criterion, scheduler=None, scaler=scaler)
         val_loss, val_acc, _, _ = evaluate(model, test_loader, criterion, collect_preds=False)
 
         history["train_loss"].append(tr_loss)
@@ -361,52 +457,50 @@ def run_experiment(model_builder, model_name, epochs=EPOCHS, lr=LR):
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
+        scheduler.step()
+
         epoch_time = time.time() - ep_start
         eta = (epochs - epoch) * epoch_time
         logger.info(f"Epoch {epoch}: tr_loss={tr_loss:.4f}, tr_acc={tr_acc*100:.2f}%, val_loss={val_loss:.4f}, val_acc={val_acc*100:.2f}%, time={epoch_time:.2f}s")
-        print(f"[{model_name}] Epoch {epoch} done. val_acc={val_acc*100:.2f}%, epoch_time={epoch_time:.2f}s, ETA={eta/60:.2f}min")
+        print(f"[{name}] Epoch {epoch} done. val_acc={val_acc*100:.2f}%, epoch_time={epoch_time:.2f}s, ETA={eta/60:.2f}min")
 
         # save checkpoint + history
         payload = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "history": history}
         torch.save(payload, ckpt_path)
-        save_history_json(history, os.path.join(root, f"{model_name}_history.json"))
+        save_history_json(history, os.path.join(root, f"{name}_history.json"))
+
+        # save plots every 10 epochs
+        if epoch % 10 == 0 or epoch == epochs:
+            plot_history(history, os.path.join(plots_dir, f"{name}_history_epoch{epoch}.png"), title_prefix=name)
 
     total_time = time.time() - t0
-    print(f"[{model_name}] Training finished in {total_time/60:.2f} minutes")
-    logger.info(f"Training finished. total_time={total_time:.2f}s")
+    print(f"[{name}] Training finished in {total_time/60:.2f} minutes")
+    logger.info(f"Finished. total_time_sec={total_time:.2f}")
 
-    # final evaluation with predictions
+    # final evaluation & artifacts
     val_loss, val_acc, preds, labels_arr = evaluate(model, test_loader, criterion, collect_preds=True)
     cm = confusion_matrix(labels_arr, preds)
-    plot_history(history, os.path.join(plots_dir, f"{model_name}_history.png"), title_prefix=model_name)
-    plot_confusion(cm, classes, os.path.join(plots_dir, f"{model_name}_confmat.png"), title=f"{model_name} Confusion Matrix")
+    plot_history(history, os.path.join(plots_dir, f"{name}_history_final.png"), title_prefix=name)
+    plot_confusion(cm, classes, os.path.join(plots_dir, f"{name}_confmat.png"), title=f"{name} Confusion Matrix")
 
-    # classification report to file
     crep = classification_report(labels_arr, preds, target_names=classes, digits=4)
-    with open(os.path.join(root, f"{model_name}_classification_report.txt"), "w") as f:
+    with open(os.path.join(root, f"{name}_classification_report.txt"), "w") as f:
         f.write(crep)
 
-    # save final metrics and history
-    final = {
-        "model": model_name,
-        "val_loss": float(val_loss),
-        "val_acc": float(val_acc),
-        "train_time_sec": total_time,
-        "history": history
-    }
-    with open(os.path.join(root, f"{model_name}_summary.json"), "w") as f:
+    final = {"model": name, "val_loss": float(val_loss), "val_acc": float(val_acc), "train_time_sec": total_time, "history": history}
+    with open(os.path.join(root, f"{name}_summary.json"), "w") as f:
         json.dump(final, f, indent=2)
 
     return final
 
-# -------------------------
-# Main orchestration
-# -------------------------
+# =========================
+# Orchestrator
+# =========================
 def main():
     experiments = OrderedDict([
         ("ResNet18", lambda: build_resnet18(num_classes=10)),
-        ("TinyViT", lambda: TinyViT(img_size=32, patch_size=4, embed_dim=128, depth=4, num_heads=4, num_classes=10)),
-        ("GATENetOpt", lambda: GATENetOptimized(num_classes=10))
+        ("TinyViT_medium", lambda: TinyViT(img_size=32, patch_size=4, embed_dim=192, depth=6, num_heads=6, num_classes=10)),
+        ("GATENet_medium", lambda: GATENetOptimized(num_classes=10))
     ])
 
     summaries = []
@@ -415,31 +509,33 @@ def main():
         summary = run_experiment(builder, name, epochs=EPOCHS, lr=LR)
         summaries.append(summary)
 
-    # write comparison CSV and PNG
-    csv_path = os.path.join(LOG_ROOT, "comparison.csv")
+    # comparison CSV and PNG
+    csv_path = os.path.join(RESULTS_DIR, "comparison.csv")
     with open(csv_path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["model", "val_acc", "val_loss", "train_time_sec"])
         for s in summaries:
             writer.writerow([s["model"], s["val_acc"], s["val_loss"], s["train_time_sec"]])
 
-    # Plot comparison bar chart
+    # bar plot
     names = [s["model"] for s in summaries]
     accs = [s["val_acc"] for s in summaries]
     losses = [s["val_loss"] for s in summaries]
 
-    plt.figure(figsize=(8,4))
+    plt.figure(figsize=(9,4))
     plt.subplot(1,2,1)
     plt.bar(names, accs)
     plt.ylabel("Val Accuracy")
-    plt.title("Validation Accuracy Comparison")
     plt.ylim(0,1)
+    plt.title("Validation Accuracy Comparison")
+
     plt.subplot(1,2,2)
     plt.bar(names, losses)
     plt.ylabel("Val Loss")
     plt.title("Validation Loss Comparison")
+
     plt.tight_layout()
-    plt.savefig(os.path.join(LOG_ROOT, "comparison_summary.png"))
+    plt.savefig(os.path.join(RESULTS_DIR, "comparison_summary.png"))
     plt.close()
 
     print("\nAll experiments finished. Results stored in 'results/' folder.")
