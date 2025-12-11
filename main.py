@@ -1,7 +1,7 @@
 """
-Complete training script: ResNet18, TinyViT (medium), Hybrid GATENet (medium).
+Full training script: SmallCNN, TinyViT (medium), Hybrid GATENet (medium).
 Strong augmentations (AutoAugment + RandomErasing), Mixup & CutMix,
-LR warmup + Cosine scheduler, checkpointing, plots, classification reports,
+LR warmup + Cosine scheduler, checkpointing, PNG plots, classification reports,
 and final comparison outputs.
 
 Save as main.py and run: python main.py
@@ -35,7 +35,7 @@ from tqdm import tqdm
 SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 128
-EPOCHS = 100                       # Option 3: 200 epochs
+EPOCHS = 200                       # Option 3: 200 epochs
 LR = 3e-4
 WEIGHT_DECAY = 0.05
 NUM_WORKERS = 4
@@ -99,16 +99,43 @@ test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_work
 # Model definitions
 # =========================
 
-# ResNet-18 baseline (adapted to CIFAR)
-def build_resnet18(num_classes=10):
-    m = torchvision.models.resnet18(weights=None)
-    # adapt first conv for CIFAR 32x32 (kernel 3, stride 1)
-    m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    m.maxpool = nn.Identity()
-    m.fc = nn.Linear(m.fc.in_features, num_classes)
-    return m
+# -------------------------
+# Small CNN baseline
+# -------------------------
+class SmallCNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),   # 32x32
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
 
+            nn.Conv2d(32, 64, 3, padding=1),  # 32x32
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                  # 16x16
+
+            nn.Conv2d(64, 128, 3, padding=1), # 16x16
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                  # 8x8
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 8 * 8, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        return self.classifier(x)
+
+# -------------------------
 # TinyViT medium
+# -------------------------
 class TinyViT(nn.Module):
     def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=192, depth=6, num_heads=6, mlp_ratio=4.0, num_classes=10):
         super().__init__()
@@ -144,7 +171,9 @@ class TinyViT(nn.Module):
         cls_out = x[:,0]
         return self.head(cls_out)
 
+# -------------------------
 # Hybrid medium: GATENet with medium channels and heads
+# -------------------------
 class LayerNorm2d(nn.Module):
     def __init__(self, C, eps=1e-6):
         super().__init__()
@@ -276,6 +305,7 @@ def apply_mixup_cutmix(x, y, alpha_mix=MIXUP_ALPHA, alpha_cut=CUTMIX_ALPHA, prob
         lam = np.random.beta(alpha_cut, alpha_cut)
         _, _, H, W = x.size()
         x1, y1, x2, y2 = rand_bbox(W, H, lam)
+        # ensure bounds valid:
         x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
         lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
         y_a, y_b = y, y[index]
@@ -326,13 +356,9 @@ def train_one_epoch(model, loader, optimizer, criterion, scheduler=None, scaler=
             loss.backward()
             optimizer.step()
 
-        if scheduler is not None:
-            # step per batch not necessary if stepping per epoch, so optional
-            pass
-
         total_loss += loss.item() * x.size(0)
         _, preds = logits.max(1)
-        # when labels were mixed, accuracy measured wrt argmax only (approx)
+        # when labels were mixed, accuracy measured wrt original labels (approx)
         correct += preds.eq(y).sum().item()
         total += y.size(0)
 
@@ -427,12 +453,12 @@ def run_experiment(builder, name, epochs=EPOCHS, lr=LR):
     model = builder().to(DEVICE)
     model = maybe_compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+
     # warmup + cosine scheduler
-    total_steps = epochs
-    # we'll step scheduler per epoch
     scheduler_warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS)
     scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs - WARMUP_EPOCHS))
     scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[WARMUP_EPOCHS])
+
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     scaler = torch.cuda.amp.GradScaler() if (USE_AMP and DEVICE.startswith("cuda")) else None
 
@@ -498,7 +524,7 @@ def run_experiment(builder, name, epochs=EPOCHS, lr=LR):
 # =========================
 def main():
     experiments = OrderedDict([
-        ("ResNet18", lambda: build_resnet18(num_classes=10)),
+        ("SmallCNN", lambda: SmallCNN(num_classes=10)),
         ("TinyViT_medium", lambda: TinyViT(img_size=32, patch_size=4, embed_dim=192, depth=6, num_heads=6, num_classes=10)),
         ("GATENet_medium", lambda: GATENetOptimized(num_classes=10))
     ])
