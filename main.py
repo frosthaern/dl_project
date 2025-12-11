@@ -35,7 +35,7 @@ from tqdm import tqdm
 SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 128
-EPOCHS = 200                       # Option 3: 200 epochs
+EPOCHS = 100                       # Option 3: 200 epochs
 LR = 3e-4
 WEIGHT_DECAY = 0.05
 NUM_WORKERS = 4
